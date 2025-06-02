@@ -55,7 +55,17 @@
         
         <!-- Video player for RTMP streams (using flv.js) -->
         <div v-if="(!stream.sourceType || stream.sourceType === 'rtmp') && stream.isActive" class="video-container">
-          <video :id="`video-${stream.streamId}`" controls autoplay muted width="640" height="360"></video>
+          <video :id="`video-${stream.streamId}`" autoplay muted width="640" height="360"></video>
+          <div class="custom-controls">
+            <button @click="togglePlay(stream)">{{ stream.isPlaying ? 'Pause' : 'Play' }}</button>
+            <select v-if="stream.recordings && stream.recordings.length > 0" @change="playRecording($event, stream)" v-model="stream.selectedRecording">
+              <option :value="null">Select a recording</option>
+              <option v-for="rec in stream.recordings" :key="rec.id" :value="rec.filePath">
+                {{ rec.filePath.split('/').pop() }} ({{ formatRecordingDate(rec.startedAt) }})
+              </option>
+            </select>
+            <span v-if="stream.currentRecordingFile">Playing: {{ stream.currentRecordingFile.split('/').pop() }}</span>
+          </div>
         </div>
         
         <!-- Offline placeholder for RTMP -->
@@ -68,10 +78,20 @@
         
         <!-- Video player for RTSP streams (native HTML5) -->
         <div v-else-if="stream.sourceType === 'rtsp' && stream.isActive" class="video-container">
-          <video controls width="640" height="360" crossorigin="anonymous">
+          <video :id="`video-${stream.streamId}`" width="640" height="360" crossorigin="anonymous" autoplay muted>
             <source :src="stream.sourceUrl" type="application/x-rtsp">
-            <p>Your browser doesn't support RTSP playback. Consider using a different method to view this stream.</p>
+            <p>Your browser doesn\'t support RTSP playback. Consider using a different method to view this stream.</p>
           </video>
+          <div class="custom-controls">
+            <button @click="togglePlay(stream)">{{ stream.isPlaying ? 'Pause' : 'Play' }}</button>
+             <select v-if="stream.recordings && stream.recordings.length > 0" @change="playRecording($event, stream)" v-model="stream.selectedRecording">
+              <option :value="null">Select a recording</option>
+              <option v-for="rec in stream.recordings" :key="rec.id" :value="rec.filePath">
+                 {{ rec.filePath.split('/').pop() }} ({{ formatRecordingDate(rec.startedAt) }})
+              </option>
+            </select>
+            <span v-if="stream.currentRecordingFile">Playing: {{ stream.currentRecordingFile.split('/').pop() }}</span>
+          </div>
           <div class="rtsp-info">
             <p><small>RTSP URL: <code>{{ stream.sourceUrl }}</code></small></p>
             <p><small>Note: Direct RTSP playback may not work in all browsers. Recording will still function.</small></p>
@@ -739,6 +759,183 @@ const deleteStream = async (streamId) => {
   }
 };
 
+const togglePlay = (stream) => {
+  const videoElement = document.getElementById(`video-${stream.streamId}`);
+  if (videoElement) {
+    if (stream.isPlaying) {
+      videoElement.pause();
+    } else {
+      if (videoElement.src) {
+        videoElement.play().catch(e => console.error(`Error playing ${stream.streamId}:`, e));
+      } else if (stream.sourceType === 'rtmp' && stream.player) {
+        stream.player.play().catch(e => console.error(`Error playing FLV ${stream.streamId}:`, e));
+      } else {
+         // If no src, and it's a live stream, try to set it up
+         if (stream.sourceType === 'rtmp') setupFlvPlayer(stream);
+         else if (stream.sourceType === 'rtsp') videoElement.src = stream.sourceUrl;
+         videoElement.play().catch(e => console.error(`Error playing ${stream.streamId} after setup:`, e));
+      }
+    }
+    stream.isPlaying = !stream.isPlaying;
+  }
+};
+
+const playRecording = async (event, stream) => {
+  const filePath = event.target.value;
+  stream.selectedRecording = filePath; // Keep track of selected recording
+
+  if (!filePath) { // User selected "Select a recording" or no recording is available
+    // Revert to live stream
+    stream.currentRecordingFile = null;
+    const videoElement = document.getElementById(`video-${stream.streamId}`);
+    if (videoElement) {
+      if (stream.sourceType === 'rtmp') {
+        if (stream.player) {
+          stream.player.unload();
+          stream.player.detachMediaElement();
+          stream.player.attachMediaElement(videoElement);
+          stream.player.loadSource(stream.httpFlvUrl); // Ensure this is the live FLV URL
+          stream.player.play();
+        } else {
+          // If player didn't exist for live stream, initialize it for live stream
+          await initializeFlvPlayer(stream.streamId);
+        }
+      } else if (stream.sourceType === 'rtsp') {
+        videoElement.src = stream.sourceUrl;
+        videoElement.load();
+        videoElement.play().catch(e => console.error(`Error playing RTSP recording ${filePath}:`, e));
+      } else {
+        // General HTML5 video playback for other types, if any
+        if (stream.player) {
+          // Re-attach and play to get the latest frames for FLV.js
+          // Ensure the player is reset to the live URL if it was playing a recording
+          console.log(`Re-attaching FLV player for live stream ${stream.streamId} on visibility change.`);
+          stream.player.unload();
+          stream.player.detachMediaElement();
+          stream.player.attachMediaElement(videoElement);
+          stream.player.loadSource(stream.httpFlvUrl); // Use live URL
+          await stream.player.play();
+        } else {
+          // If no player instance exists (e.g., after an error or if it was a recording player that got cleaned up)
+          console.log(`No existing FLV player for ${stream.streamId} on visibility change, calling initializeFlvPlayer for live stream.`);
+          await initializeFlvPlayer(stream.streamId); 
+        }
+      }
+      stream.isPlaying = true;
+    }
+    return;
+  }
+
+  const videoElement = document.getElementById(`video-${stream.streamId}`);
+  if (videoElement) {
+    const recordingUrl = `/recordings/${filePath}`; 
+
+    if (stream.player) { // Destroy any existing FLV player
+      stream.player.destroy();
+      stream.player = null;
+    }
+    
+    if (stream.sourceType === 'rtsp') {
+        videoElement.src = recordingUrl;
+        videoElement.load(); 
+        videoElement.play().catch(e => console.error(`Error playing RTSP recording ${filePath}:`, e));
+    } else if (stream.sourceType === 'rtmp') { 
+        if (FlvJs && FlvJs.isSupported()) {
+            const newFlvPlayer = FlvJs.createPlayer({
+                type: 'flv',
+                isLive: false, // This is a recording
+                url: recordingUrl,
+                hasAudio: true, 
+                hasVideo: true
+            }, {
+                enableStashBuffer: true,
+                stashInitialSize: 1024 * 256, // 256KB stash for recordings
+            });
+            newFlvPlayer.attachMediaElement(videoElement);
+            newFlvPlayer.load();
+            newFlvPlayer.play().catch(e => console.error(`Error playing FLV recording ${filePath} with new player:`, e));
+            stream.player = newFlvPlayer; // Assign the new recording player
+        } else {
+            console.warn("FlvJs not supported or available. Falling back to direct src for FLV recording.");
+            videoElement.src = recordingUrl; 
+            videoElement.play().catch(e => console.error(`Error playing FLV recording directly (fallback) ${filePath}:`, e));
+        }
+    } else { 
+        videoElement.src = recordingUrl;
+        videoElement.play().catch(e => console.error(`Error playing recording ${filePath}:`, e));
+    }
+    stream.currentRecordingFile = filePath;
+    stream.isPlaying = true;
+  }
+};
+
+const formatRecordingDate = (dateString) => {
+  if (!dateString) return '';
+  const date = new Date(dateString);
+  return date.toLocaleString([], { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+};
+
+// Function to handle visibility change
+const handleVisibilityChange = () => {
+  if (document.visibilityState === 'visible') {
+    streams.value.forEach(async stream => {
+      const videoElement = document.getElementById(`video-${stream.streamId}`);
+      if (videoElement && stream.isActive) {
+        try {
+          if (stream.player) { // Destroy existing player before re-initializing
+            stream.player.destroy();
+            stream.player = null;
+          }
+
+          if (stream.currentRecordingFile && stream.selectedRecording) {
+            console.log(`Resuming recording ${stream.currentRecordingFile} for ${stream.streamId} on visibility change.`);
+            const recordingUrl = `/recordings/${stream.currentRecordingFile}`;
+            if (stream.sourceType === 'rtsp') {
+              videoElement.src = recordingUrl;
+              videoElement.load();
+              await videoElement.play();
+            } else if (stream.sourceType === 'rtmp') {
+              if (FlvJs && FlvJs.isSupported()) {
+                const recordingPlayer = FlvJs.createPlayer({
+                    type: 'flv',
+                    isLive: false,
+                    url: recordingUrl,
+                    hasAudio: true,
+                    hasVideo: true
+                }, {
+                    enableStashBuffer: true,
+                    stashInitialSize: 1024 * 256,
+                });
+                recordingPlayer.attachMediaElement(videoElement);
+                recordingPlayer.load();
+                await recordingPlayer.play();
+                stream.player = recordingPlayer;
+              } else {
+                videoElement.src = recordingUrl; // Fallback
+                await videoElement.play();
+              }
+            }
+            stream.isPlaying = true;
+          } else {
+            console.log(`Refreshing live stream for ${stream.streamId} on visibility change`);
+            if (stream.sourceType === 'rtmp') {
+              await initializeFlvPlayer(stream.streamId); // This will create and assign to stream.player
+            } else if (stream.sourceType === 'rtsp') {
+              videoElement.src = stream.sourceUrl; 
+              videoElement.load();
+              await videoElement.play();
+            }
+            stream.isPlaying = true; 
+          }
+        } catch (e) {
+            console.error(`Error resuming/restarting play for ${stream.streamId} on visibility change:`, e);
+            stream.isPlaying = false; // Update status if play failed
+        }
+      }
+    });
+  }
+};
+
 onMounted(async () => {
   if (typeof window !== 'undefined') {
     rtmpStreamUrl.value = `rtmp://${window.location.hostname}:${rtmpPort}/${rtmpAppName}/<STREAM_KEY>`;
@@ -753,33 +950,50 @@ onMounted(async () => {
       } else {
         error.value = 'Failed to load flv.js library.';
         console.error('Failed to load flv.js library.');
-        return;
+        // return; // Commented out to allow RTSP to work if FLV.js fails
       }
     } catch (e) {
       error.value = 'Error importing flv.js: ' + e.message;
       console.error('Error importing flv.js:', e);
-      return;
+      // return; // Commented out to allow RTSP to work if FLV.js fails
     }
     
     await initializeWebSocket();
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    // Initial fetch of streams and their recordings
+    // fetchStreams(true); // Moved to initializeWebSocket to ensure FlvJs is loaded
   } else {
     connecting.value = false;
-    error.value = 'WebSocket and flv.js can only run in the browser.';
+    // error.value = 'WebSocket and flv.js can only run in the browser.';
   }
 });
 
 onBeforeUnmount(() => {
+  streams.value.forEach(stream => {
+    if (stream.player) {
+      stream.player.destroy();
+      stream.player = null; // Clean up player instance
+    }
+  });
   if (ws) {
     console.log('[WebSocket] Closing WebSocket connection before component unmount.');
     ws.close();
   }
-  streams.value.forEach(stream => {
-    if (stream.player) {
-      stream.player.destroy();
-    }
-  });
-  streams.value = [];
+  document.removeEventListener('visibilitychange', handleVisibilityChange);
 });
+
+// Helper function to get the latest recording for a stream
+// This is a placeholder, actual logic might depend on how recordings are named or sorted
+// For now, it assumes recordings are sorted by date in stream.recordings
+/* // This helper might not be strictly needed if using selectedRecording or currentRecordingFile
+const getLatestRecordingPath = (stream) => {
+  if (stream.recordings && stream.recordings.length > 0) {
+    // Assuming recordings are pre-sorted with newest first
+    return stream.recordings[0].filePath;
+  }
+  return null;
+};
+*/
 
 </script>
 
@@ -868,17 +1082,22 @@ h1 {
 }
 
 .streams-container {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(680px, 1fr));
-  gap: 20px;
+  display: flex; 
+  flex-wrap: wrap; 
+  gap: 1px; /* Thin line separation */
+  background-color: #ccc; /* Color of the thin line */
 }
 
 .stream-player {
-  border: 1px solid #ddd;
-  padding: 20px;
-  border-radius: 8px;
-  background: white;
-  box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+  background-color: #fff; 
+  border-radius: 0px; 
+  box-shadow: none; /* Remove individual shadow for a flatter look */
+  display: flex;
+  flex-direction: column;
+  overflow: hidden; 
+  flex: 1 1 320px; /* Base size, allows wrapping */
+  min-width: 300px; /* Minimum width before wrapping */
+  border: none; /* Remove individual borders, gap will create lines */
 }
 
 .stream-header {
@@ -956,7 +1175,20 @@ h1 {
 }
 
 .video-container {
-  margin-bottom: 15px;
+  position: relative;
+  background-color: #000; 
+  width: 100%; 
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-height: 180px; 
+}
+
+.video-container video {
+  width: 100%; 
+  height: auto; 
+  max-height: 500px; 
+  display: block; 
 }
 
 .offline-placeholder {
@@ -1187,5 +1419,60 @@ p {
   text-align: center;
   color: #555;
   margin-bottom: 10px;
+}
+
+.custom-controls {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0; /* Ensure it spans full width */
+  background-color: rgba(0, 0, 0, 0.6);
+  color: white;
+  padding: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between; /* Better distribution */
+  opacity: 0; 
+  transition: opacity 0.3s ease-in-out;
+  z-index: 10;
+}
+
+.stream-player:hover .custom-controls {
+  opacity: 1; 
+}
+
+.custom-controls button {
+  background-color: rgba(50, 50, 50, 0.8);
+  color: white;
+  border: 1px solid rgba(255,255,255,0.2);
+  padding: 6px 12px;
+  cursor: pointer;
+  border-radius: 4px;
+  font-size: 0.9em;
+}
+
+.custom-controls button:hover {
+  background-color: rgba(70, 70, 70, 0.9);
+}
+
+.custom-controls select {
+  background-color: rgba(50, 50, 50, 0.8);
+  color: white;
+  border: 1px solid rgba(255,255,255,0.2);
+  padding: 6px;
+  border-radius: 4px;
+  font-size: 0.9em;
+  max-width: 180px; 
+  margin: 0 10px; /* Add some margin */
+}
+
+.custom-controls span {
+  font-size: 0.85em;
+  margin-left: 10px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 120px; 
+  flex-shrink: 1; /* Allow shrinking if space is tight */
 }
 </style> 
